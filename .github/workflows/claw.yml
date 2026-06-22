@@ -1,0 +1,919 @@
+name: Claw
+run-name: "skill: ${{ inputs.skill || 'feature' }}${{ inputs.var && format(' ({0})', inputs.var) || '' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      skill:
+        description: 'Skill name (must match a directory under skills/)'
+        required: true
+        type: string
+      model:
+        description: 'Model'
+        required: false
+        type: choice
+        default: '(config default)'
+        options:
+          - '(config default)'
+          - claude-opus-4-7
+          - claude-sonnet-4-6
+          - claude-haiku-4-5-20251001
+          - gemini-3-pro
+          - gemini-3-flash
+          - gpt-5.2
+          - kimi-k2.5
+          - qwen3-coder
+      var:
+        description: 'Variable (e.g. AI, bitcoin, owner/repo)'
+        required: false
+        type: string
+      chain_context_file:
+        description: 'Path to file with prior chain step outputs (set by chain runner)'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      skill:
+        description: 'Skill to run'
+        required: true
+        type: string
+      model:
+        description: 'Model override'
+        required: false
+        type: string
+      var:
+        description: 'Variable'
+        required: false
+        type: string
+      chain_context_file:
+        description: 'Chain context file path'
+        required: false
+        type: string
+  issues:
+    types: [labeled]
+  repository_dispatch:
+    # Inbound webhook triggers. Send a POST to
+    #   https://api.github.com/repos/<owner>/<repo>/dispatches
+    # with { event_type: "trigger-<skill>", client_payload: { var: "...", model: "..." } }
+    # Any event_type that starts with "trigger-" routes the suffix as the skill name.
+    types: [trigger-*]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+  actions: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: '--no-deprecation'
+
+concurrency:
+  group: claw-${{ inputs.skill || github.event.action || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    if: github.event_name != 'issues' || github.event.label.name == 'ai-build'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Early checkout
+        if: github.event_name == 'issues'
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Determine skill
+        id: skill
+        env:
+          DISPATCH_EVENT_TYPE: ${{ github.event.action }}
+          DISPATCH_VAR: ${{ github.event.client_payload.var }}
+          DISPATCH_MODEL: ${{ github.event.client_payload.model }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event_name }}" = "workflow_call" ]; then
+            echo "name=${{ inputs.skill }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "issues" ]; then
+            echo "name=feature" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            # event_type "trigger-foo" -> skill "foo"
+            SKILL_FROM_EVENT="${DISPATCH_EVENT_TYPE#trigger-}"
+            if [ -z "$SKILL_FROM_EVENT" ] || [ "$SKILL_FROM_EVENT" = "$DISPATCH_EVENT_TYPE" ]; then
+              echo "::error::repository_dispatch event_type must be 'trigger-<skill>', got '$DISPATCH_EVENT_TYPE'"
+              exit 1
+            fi
+            echo "name=$SKILL_FROM_EVENT" >> "$GITHUB_OUTPUT"
+            echo "dispatch_var=$DISPATCH_VAR" >> "$GITHUB_OUTPUT"
+            echo "dispatch_model=$DISPATCH_MODEL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if there's work
+        id: work
+        run: |
+          if [ -n "${{ steps.skill.outputs.name }}" ]; then
+            echo "mode=skill" >> "$GITHUB_OUTPUT"
+            echo "label=${{ steps.skill.outputs.name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Nothing to do"
+          fi
+
+      - name: Checkout repo
+        if: steps.work.outputs.mode != ''
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        if: steps.work.outputs.mode != ''
+        run: |
+          git config user.name "clawframework"
+          git config user.email "clawframework@proton.me"
+
+      - name: Setup Node.js
+        if: steps.work.outputs.mode != ''
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Install Claude Code
+        if: steps.work.outputs.mode != ''
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate skill secrets
+        if: steps.work.outputs.mode != ''
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          SUPERNOTES_API_KEY: ${{ secrets.SUPERNOTES_API_KEY }}
+        run: |
+          SKILL_FILE="skills/${{ steps.skill.outputs.name }}/SKILL.md"
+          [ ! -f "$SKILL_FILE" ] && exit 0
+
+          # Extract secret references (VAR_API_KEY, VAR_TOKEN, etc.)
+          SECRETS=$(grep -oE '\$\{?[A-Z][A-Z0-9_]{2,}\}?' "$SKILL_FILE" 2>/dev/null | \
+            sed 's/[${}]//g' | \
+            grep -E '_(API_KEY|KEY|TOKEN|SECRET|WEBHOOK_URL)$' | \
+            grep -vE '^(GITHUB_TOKEN|GH_TOKEN|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|BANKR_LLM_KEY|TELEGRAM_|DISCORD_|SLACK_)' | \
+            sort -u) || true
+
+          [ -z "$SECRETS" ] && exit 0
+
+          MISSING=() OPTIONAL=()
+          while IFS= read -r secret; do
+            [ -z "$secret" ] && continue
+            if [ -z "${!secret:-}" ]; then
+              if grep -qiE "(if.*${secret}.*is (not )?set|${secret}.*(optional|falls? back)|without)" "$SKILL_FILE" 2>/dev/null; then
+                OPTIONAL+=("$secret")
+              else
+                MISSING+=("$secret")
+              fi
+            fi
+          done <<< "$SECRETS"
+
+          [ ${#OPTIONAL[@]} -gt 0 ] && echo "::notice::Optional secrets not set: ${OPTIONAL[*]} (skill will use fallbacks)"
+          [ ${#MISSING[@]} -gt 0 ] && echo "::warning::Secrets not set: ${MISSING[*]} — skill may fail or produce incomplete results"
+          exit 0
+
+      - name: Run pre-fetch scripts
+        if: steps.work.outputs.mode != ''
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          SKILL_VAR: ${{ inputs.var || steps.skill.outputs.dispatch_var }}
+        run: |
+          # Run all scripts/prefetch-*.sh before Claude starts (outside sandbox).
+          # Each script receives the skill name and var as arguments.
+          # Scripts should check their own env vars and exit 0 if not configured.
+          # SKILL_VAR comes through env (not template interpolation) so embedded
+          # $TOKEN / $VAR references in the user input aren't eaten by bash.
+          SKILL="${{ steps.skill.outputs.name }}"
+          VAR="$SKILL_VAR"
+          for script in scripts/prefetch-*.sh; do
+            [ -f "$script" ] || continue
+            chmod +x "$script"
+            echo "Running $(basename "$script")..."
+            ./"$script" "$SKILL" "$VAR" || echo "::notice::$(basename "$script") skipped or failed (non-fatal)"
+          done
+
+      - name: Run
+        id: run
+        if: steps.work.outputs.mode != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          BANKR_LLM_KEY: ${{ secrets.BANKR_LLM_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NOTIFY_EMAIL_FROM: ${{ vars.NOTIFY_EMAIL_FROM || 'claw@notifications.clawtrl.bot' }}
+          NOTIFY_EMAIL_SUBJECT_PREFIX: ${{ vars.NOTIFY_EMAIL_SUBJECT_PREFIX || '[Claw]' }}
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+          ALCHEMY_API_KEY: ${{ secrets.ALCHEMY_API_KEY }}
+          BANKR_API_KEY: ${{ secrets.BANKR_API_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DEVTO_API_KEY: ${{ secrets.DEVTO_API_KEY }}
+          NEYNAR_API_KEY: ${{ secrets.NEYNAR_API_KEY }}
+          NEYNAR_SIGNER_UUID: ${{ secrets.NEYNAR_SIGNER_UUID }}
+          CLAWTRL_WALLET_PRIVATE_KEY: ${{ secrets.CLAWTRL_WALLET_PRIVATE_KEY }}
+          CLAWTRL_WALLET_ADDRESS: ${{ secrets.CLAWTRL_WALLET_ADDRESS }}
+          CLAWTRL_WALLET_NETWORK: ${{ secrets.CLAWTRL_WALLET_NETWORK }}
+          CLAWTRL_WALLET_DAILY_CAP_USDC: ${{ secrets.CLAWTRL_WALLET_DAILY_CAP_USDC }}
+          X402_TARGETS: ${{ secrets.X402_TARGETS }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          JSONRENDER_ENABLED: ${{ vars.JSONRENDER_ENABLED || 'true' }}
+          SKILL_VAR: ${{ inputs.var || steps.skill.outputs.dispatch_var }}
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          SKILL_NAME="${{ steps.skill.outputs.name }}"
+          export SKILL_NAME
+          CONFIG_MODEL=$(grep -E '^model:' claw.yml | sed 's/^model: *//' | tr -d ' ')
+          # Check for per-skill model override in claw.yml (extract quoted value, ignore comments)
+          SKILL_MODEL=$(grep "^  ${SKILL_NAME}:" claw.yml | sed -n 's/.*model: *"\([^"]*\)".*/\1/p')
+          INPUT_MODEL="${{ inputs.model || steps.skill.outputs.dispatch_model }}"
+          if [ -n "$INPUT_MODEL" ] && [ "$INPUT_MODEL" != "(config default)" ]; then
+            MODEL="$INPUT_MODEL"
+          elif [ -n "$SKILL_MODEL" ]; then
+            MODEL="$SKILL_MODEL"
+          else
+            MODEL="${CONFIG_MODEL:-claude-opus-4-7}"
+          fi
+          echo "Using model: $MODEL"
+          echo "SKILL_MODEL=$MODEL" >> "$GITHUB_OUTPUT"
+
+          # --- AI Gateway routing ---
+          GATEWAY=$(grep -A1 '^gateway:' claw.yml | grep 'provider:' | sed 's/.*provider: *//' | tr -d ' "'"'" || echo "direct")
+          GATEWAY="${GATEWAY:-direct}"
+          echo "Gateway: $GATEWAY"
+
+          echo "GATEWAY=$GATEWAY" >> "$GITHUB_OUTPUT"
+
+          if [ "$GATEWAY" = "bankr" ]; then
+            if [ -z "${BANKR_LLM_KEY:-}" ]; then
+              echo "::error::gateway.provider=bankr but BANKR_LLM_KEY secret is not set"
+              exit 1
+            fi
+            export ANTHROPIC_BASE_URL="https://llm.bankr.bot"
+            export ANTHROPIC_AUTH_TOKEN="$BANKR_LLM_KEY"
+            unset ANTHROPIC_API_KEY
+            unset CLAUDE_CODE_OAUTH_TOKEN
+            echo "::notice::Routing through Bankr Gateway (https://llm.bankr.bot)"
+          else
+            echo "::notice::Using direct Anthropic API"
+          fi
+
+          # Generate notify script in workspace (Claude calls: ./notify "message")
+          # Messages are saved to .pending-notify/ for reliable post-run delivery
+          # (sandbox may block outbound curl during Claude's run)
+          # Pre-create .pending-notify/ so the sandbox doesn't block Claude's first write into it
+          mkdir -p .pending-notify
+          : > .notify-sent-hashes
+
+          cat > ./notify << 'NOTIFY_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          MSG="$1"
+
+          # Suppress obvious diagnostic probes (short messages containing test/trace/ping/debug/hello).
+          # Claude sometimes issues these to verify the notify script works — they should not reach channels.
+          MSG_LEN=${#MSG}
+          if [ "$MSG_LEN" -lt 120 ]; then
+            MSG_LOWER=$(printf '%s' "$MSG" | tr '[:upper:]' '[:lower:]')
+            case "$MSG_LOWER" in
+              *test*|*trace*|*ping*|*debug*|hello|hi)
+                echo "notify: suppressing trace/test message ($MSG_LEN chars): $MSG" >&2
+                exit 0
+                ;;
+            esac
+          fi
+
+          # Dedup within this workflow run — same message never sent twice even if ./notify is called again
+          HASH=$(printf '%s' "$MSG" | sha256sum | awk '{print $1}')
+          HASH_FILE=".notify-sent-hashes"
+          touch "$HASH_FILE" 2>/dev/null || true
+          if [ -f "$HASH_FILE" ] && grep -qxF "$HASH" "$HASH_FILE" 2>/dev/null; then
+            echo "notify: duplicate message (hash ${HASH:0:8}), skipping" >&2
+            exit 0
+          fi
+          printf '%s\n' "$HASH" >> "$HASH_FILE" 2>/dev/null || true
+
+          # Always save to .pending-notify/ for post-run delivery (sandbox fallback)
+          TS=$(date -u +%s)
+          echo "$MSG" > ".pending-notify/${TS}.md"
+
+          # Attempt immediate delivery (may fail in sandbox — post-run step retries)
+          DELIVERED=false
+
+          # Telegram: 4096 char limit, strict Markdown parsing
+          if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+            # Split $MSG into chunks ≤3900 chars (Telegram cap 4096, leaves room for
+            # "[i/N]" suffix). Prefer paragraph (\n\n) then line (\n) boundaries,
+            # hard-split only if a single paragraph/line exceeds the limit.
+            # Chunks emitted one per line as base64 to preserve embedded newlines.
+            TG_CHUNKS_B64=$(printf '%s' "$MSG" | python3 -c '
+          import sys, base64
+          LIMIT = 3900
+          text = sys.stdin.read()
+          def pack(parts, sep):
+              out, cur = [], ""
+              for p in parts:
+                  glue = sep if cur else ""
+                  if len(cur) + len(glue) + len(p) <= LIMIT:
+                      cur += glue + p
+                  else:
+                      if cur:
+                          out.append(cur); cur = ""
+                      if len(p) > LIMIT and sep == "\n\n":
+                          out.extend(pack(p.split("\n"), "\n"))
+                      elif len(p) > LIMIT:
+                          while len(p) > LIMIT:
+                              out.append(p[:LIMIT]); p = p[LIMIT:]
+                          cur = p
+                      else:
+                          cur = p
+              if cur:
+                  out.append(cur)
+              return out
+          chunks = [text] if len(text) <= LIMIT else pack(text.split("\n\n"), "\n\n")
+          N = len(chunks)
+          for i, c in enumerate(chunks):
+              suffix = f"\n\n[{i+1}/{N}]" if N > 1 else ""
+              sys.stdout.write(base64.b64encode((c + suffix).encode()).decode() + "\n")
+          ')
+            while IFS= read -r TG_CHUNK_B64; do
+              [ -z "$TG_CHUNK_B64" ] && continue
+              TG_MSG=$(printf '%s' "$TG_CHUNK_B64" | base64 -d)
+              TG_RESULT=$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$TG_MSG" '{chat_id: $chat, text: $text, parse_mode: "Markdown"}')" 2>/dev/null) || true
+              TG_HTTP=$(echo "$TG_RESULT" | tail -1)
+              TG_OK=$(echo "$TG_RESULT" | sed '$d' | jq -r '.ok // false' 2>/dev/null || echo "false")
+              if [ "$TG_HTTP" = "200" ] && [ "$TG_OK" = "true" ]; then
+                DELIVERED=true
+              else
+                curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$TG_MSG" '{chat_id: $chat, text: $text}')" > /dev/null 2>&1 && DELIVERED=true || true
+              fi
+              # Preserve chunk ordering in the Telegram channel
+              sleep 0.3
+            done <<< "$TG_CHUNKS_B64"
+          fi
+
+          if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+            curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg text "$MSG" '{content: $text}')" > /dev/null && DELIVERED=true || true
+          fi
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg text "$MSG" '{text: $text}')" > /dev/null && DELIVERED=true || true
+          fi
+          # Email via SendGrid
+          if [ -n "${SENDGRID_API_KEY:-}" ] && [ -n "${NOTIFY_EMAIL_TO:-}" ]; then
+            FROM="${NOTIFY_EMAIL_FROM:-claw@notifications.clawtrl.bot}"
+            PREFIX="${NOTIFY_EMAIL_SUBJECT_PREFIX:-[Claw]}"
+            SUBJECT="$PREFIX ${SKILL_NAME:-notification}"
+            HTML_BODY=$(printf '%s' "$MSG" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+            HTML_BODY="<html><body><pre style=\"font-family:monospace;white-space:pre-wrap;\">${HTML_BODY}</pre></body></html>"
+            curl -sf -X POST "https://api.sendgrid.com/v3/mail/send" \
+              -H "Authorization: Bearer ${SENDGRID_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg from "$FROM" \
+                --arg to "$NOTIFY_EMAIL_TO" \
+                --arg subject "$SUBJECT" \
+                --arg html "$HTML_BODY" \
+                --arg text "$MSG" \
+                '{personalizations:[{to:[{email:$to}]}],from:{email:$from},subject:$subject,content:[{type:"text/plain",value:$text},{type:"text/html",value:$html}]}')" > /dev/null 2>&1 || true
+          fi
+          # json-render channel — save raw message for post-run conversion
+          if [ "${JSONRENDER_ENABLED:-false}" = "true" ] && [ -n "${SKILL_NAME:-}" ]; then
+            mkdir -p dashboard/outputs
+            echo "$MSG" > "dashboard/outputs/.pending-${SKILL_NAME}.md"
+          fi
+
+          # Remove pending file if immediate delivery succeeded (prevents double-send)
+          if [ "$DELIVERED" = "true" ]; then
+            rm -f ".pending-notify/${TS}.md"
+          fi
+          NOTIFY_SCRIPT
+          chmod +x ./notify
+
+          ALLOWED="Read,Write,Edit,Glob,Grep,WebFetch,WebSearch"
+          ALLOWED="$ALLOWED,Bash(curl:*),Bash(gh:*),Bash(git:*),Bash(jq:*)"
+          ALLOWED="$ALLOWED,Bash(./notify:*),Bash(./notify-jsonrender:*)"
+          ALLOWED="$ALLOWED,Bash(mkdir:*),Bash(ls:*),Bash(cat:*),Bash(chmod:*)"
+          ALLOWED="$ALLOWED,Bash(date:*),Bash(echo:*),Bash(node:*),Bash(npm:*),Bash(npx:*)"
+          ALLOWED="$ALLOWED,Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sort:*),Bash(grep:*)"
+
+          SKILL_NAME="${{ steps.skill.outputs.name }}"
+          VAR="$SKILL_VAR"
+
+          # Build prompt — inject chain context if running as part of a chain
+          CHAIN_CTX="${{ inputs.chain_context_file }}"
+          if [ -n "$CHAIN_CTX" ] && [ -f "$CHAIN_CTX" ]; then
+            CONTEXT=$(cat "$CHAIN_CTX")
+            PROMPT="Today is $TODAY.
+
+          ## Context from prior chain steps
+          $CONTEXT
+
+          Read and execute the skill defined in skills/${SKILL_NAME}/SKILL.md
+          Use the chain context above instead of re-running those skills. Synthesize and build on their outputs."
+          else
+            PROMPT="Today is $TODAY. Read and execute the skill defined in skills/${SKILL_NAME}/SKILL.md"
+          fi
+          if [ -n "$VAR" ]; then
+            PROMPT="$PROMPT
+
+          Use this variable (override the default in the skill file):
+          var=$VAR"
+          fi
+          if ! CLAUDE_OUTPUT=$(echo "$PROMPT" | claude -p - \
+            --model "$MODEL" --allowedTools "$ALLOWED" \
+            --output-format json 2>&1); then
+            echo "::error::Claude CLI failed. Output: $CLAUDE_OUTPUT"
+            # Save error signature for quality tracking (cron-state step reads this)
+            echo "$CLAUDE_OUTPUT" | tail -c 500 | tr '\n' ' ' | cut -c1-200 > /tmp/skill-error.txt
+            exit 1
+          fi
+
+          # Extract and print the text result so logs still show skill output
+          RESULT_TEXT=$(echo "$CLAUDE_OUTPUT" | jq -r '.result // empty')
+          echo "$RESULT_TEXT"
+          # Save result for output capture step
+          echo "$RESULT_TEXT" > /tmp/skill-result.txt
+
+          # Parse token usage from JSON response
+          INPUT_TOKENS=$(echo "$CLAUDE_OUTPUT" | jq '.usage.input_tokens // 0')
+          OUTPUT_TOKENS=$(echo "$CLAUDE_OUTPUT" | jq '.usage.output_tokens // 0')
+          CACHE_READ=$(echo "$CLAUDE_OUTPUT" | jq '.usage.cache_read_input_tokens // 0')
+          CACHE_CREATION=$(echo "$CLAUDE_OUTPUT" | jq '.usage.cache_creation_input_tokens // 0')
+          TOTAL_TOKENS=$((INPUT_TOKENS + OUTPUT_TOKENS))
+
+          echo "SKILL_INPUT_TOKENS=$INPUT_TOKENS" >> "$GITHUB_OUTPUT"
+          echo "SKILL_OUTPUT_TOKENS=$OUTPUT_TOKENS" >> "$GITHUB_OUTPUT"
+          echo "SKILL_CACHE_READ_TOKENS=$CACHE_READ" >> "$GITHUB_OUTPUT"
+          echo "SKILL_CACHE_CREATION_TOKENS=$CACHE_CREATION" >> "$GITHUB_OUTPUT"
+          echo "SKILL_TOTAL_TOKENS=$TOTAL_TOKENS" >> "$GITHUB_OUTPUT"
+
+          echo "::notice::Token usage — input: $INPUT_TOKENS, output: $OUTPUT_TOKENS, cache_read: $CACHE_READ, cache_creation: $CACHE_CREATION, total: $TOTAL_TOKENS"
+
+      - name: Log token usage
+        if: steps.work.outputs.mode != ''
+        run: |
+          SKILL="${{ steps.skill.outputs.name }}"
+          INPUT="${{ steps.run.outputs.SKILL_INPUT_TOKENS }}"
+          OUTPUT="${{ steps.run.outputs.SKILL_OUTPUT_TOKENS }}"
+          CACHE_READ="${{ steps.run.outputs.SKILL_CACHE_READ_TOKENS }}"
+          CACHE_CREATION="${{ steps.run.outputs.SKILL_CACHE_CREATION_TOKENS }}"
+          TOTAL="${{ steps.run.outputs.SKILL_TOTAL_TOKENS }}"
+          echo "## Token Usage: $SKILL" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Tokens |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Input | $INPUT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Output | $OUTPUT |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cache read | $CACHE_READ |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cache creation | $CACHE_CREATION |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Total** | **$TOTAL** |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Track token costs
+        if: steps.work.outputs.mode != '' && steps.run.outcome == 'success'
+        run: |
+          CSV="memory/token-usage.csv"
+          mkdir -p memory
+          if [ ! -f "$CSV" ]; then
+            echo "date,skill,model,input_tokens,output_tokens,cache_read,cache_creation" > "$CSV"
+          fi
+          echo "$(date -u +%Y-%m-%d),${{ steps.skill.outputs.name }},${{ steps.run.outputs.SKILL_MODEL }},${{ steps.run.outputs.SKILL_INPUT_TOKENS }},${{ steps.run.outputs.SKILL_OUTPUT_TOKENS }},${{ steps.run.outputs.SKILL_CACHE_READ_TOKENS }},${{ steps.run.outputs.SKILL_CACHE_CREATION_TOKENS }}" >> "$CSV"
+
+      - name: Capture skill output
+        if: steps.work.outputs.mode != '' && steps.run.outcome == 'success'
+        run: |
+          SKILL="${{ steps.skill.outputs.name }}"
+          mkdir -p .outputs
+          # Save the notification message as a chain artifact
+          PENDING="dashboard/outputs/.pending-${SKILL}.md"
+          if [ -f "$PENDING" ]; then
+            cp "$PENDING" ".outputs/${SKILL}.md"
+          elif [ -f /tmp/skill-result.txt ] && [ -s /tmp/skill-result.txt ]; then
+            cp /tmp/skill-result.txt ".outputs/${SKILL}.md"
+          else
+            echo "_No output captured._" > ".outputs/${SKILL}.md"
+          fi
+          echo "::notice::Skill output captured to .outputs/${SKILL}.md ($(wc -c < ".outputs/${SKILL}.md") bytes)"
+
+      - name: Analyze skill output
+        id: analyze
+        if: steps.work.outputs.mode != '' && steps.run.outcome == 'success'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          BANKR_LLM_KEY: ${{ secrets.BANKR_LLM_KEY }}
+        run: |
+          SKILL="${{ steps.skill.outputs.name }}"
+
+          # Skip analysis for meta skills (they don't produce scorable output)
+          case "$SKILL" in heartbeat|skill-health|skill-analytics|reflect|memory-flush|self-review|cost-report) echo "Skipping analysis for meta skill"; exit 0;; esac
+
+          # Route through gateway if configured
+          if [ "${{ steps.run.outputs.GATEWAY }}" = "bankr" ] && [ -n "${BANKR_LLM_KEY:-}" ]; then
+            export ANTHROPIC_BASE_URL="https://llm.bankr.bot"
+            export ANTHROPIC_AUTH_TOKEN="$BANKR_LLM_KEY"
+            unset ANTHROPIC_API_KEY
+            unset CLAUDE_CODE_OAUTH_TOKEN
+          fi
+
+          # Read and truncate skill output for analysis
+          OUTPUT=""
+          if [ -f /tmp/skill-result.txt ] && [ -s /tmp/skill-result.txt ]; then
+            OUTPUT=$(head -c 3000 /tmp/skill-result.txt)
+          fi
+          [ -z "$OUTPUT" ] && { echo "No output to analyze"; exit 0; }
+
+          ANALYSIS_PROMPT="Score this autonomous agent skill output on a 1-5 scale. Respond with ONLY valid JSON.
+
+          Scoring:
+          1 = Failed/empty/error output
+          2 = Ran but low quality, generic, or boilerplate
+          3 = Acceptable — completed the task adequately
+          4 = Good — substantive, well-structured, useful
+          5 = Excellent — insightful, well-sourced, actionable
+
+          Flag any issues from: api_error, empty_output, low_quality, stale_data, generic_content, rate_limited
+
+          Skill: $SKILL
+          Output (truncated):
+          $OUTPUT
+
+          JSON format: {\"score\": N, \"assessment\": \"one line\", \"flags\": []}"
+
+          if ! RAW=$(echo "$ANALYSIS_PROMPT" | claude -p - \
+            --model claude-haiku-4-5-20251001 --output-format json 2>&1); then
+            echo "::warning::Skill analysis failed (non-fatal)"
+            exit 0
+          fi
+
+          ANALYSIS_TEXT=$(echo "$RAW" | jq -r '.result // empty')
+          [ -z "$ANALYSIS_TEXT" ] && { echo "::warning::Empty analysis result"; exit 0; }
+
+          # Parse score from response (try direct JSON, then extract embedded JSON)
+          if echo "$ANALYSIS_TEXT" | jq empty 2>/dev/null; then
+            PARSED="$ANALYSIS_TEXT"
+          else
+            PARSED=$(echo "$ANALYSIS_TEXT" | grep -o '{[^{}]*}' | head -1 || true)
+            if [ -z "$PARSED" ] || ! echo "$PARSED" | jq empty 2>/dev/null; then
+              echo "::warning::Could not parse analysis JSON"
+              exit 0
+            fi
+          fi
+
+          SCORE=$(echo "$PARSED" | jq -r '.score // 0')
+          ASSESSMENT=$(echo "$PARSED" | jq -r '.assessment // "analysis incomplete"')
+          FLAGS=$(echo "$PARSED" | jq -c '.flags // []')
+
+          # Validate score range
+          if [ "$SCORE" -lt 1 ] || [ "$SCORE" -gt 5 ] 2>/dev/null; then
+            SCORE=0
+          fi
+
+          echo "QUALITY_SCORE=$SCORE" >> "$GITHUB_OUTPUT"
+
+          # Write skill health file with rolling history
+          mkdir -p memory/skill-health
+          HEALTH_FILE="memory/skill-health/${SKILL}.json"
+          NOW_ISO=$(date -u +%FT%TZ)
+          TODAY=$(date -u +%Y-%m-%d)
+
+          if [ -f "$HEALTH_FILE" ] && jq empty "$HEALTH_FILE" 2>/dev/null; then
+            HISTORY=$(jq -c '.history // []' "$HEALTH_FILE")
+          else
+            HISTORY='[]'
+          fi
+
+          # Append to history (keep last 30 entries)
+          HISTORY=$(echo "$HISTORY" | jq -c --arg d "$TODAY" --argjson s "$SCORE" \
+            '. + [{"date": $d, "score": $s}] | .[-30:]')
+
+          AVG=$(echo "$HISTORY" | jq '([.[].score] | add / length * 100 | round) / 100')
+
+          jq -n --arg sk "$SKILL" --arg ts "$NOW_ISO" --argjson sc "$SCORE" \
+            --arg as "$ASSESSMENT" --argjson fl "$FLAGS" \
+            --argjson hi "$HISTORY" --argjson avg "$AVG" \
+            '{skill: $sk, last_analyzed: $ts, quality_score: $sc, assessment: $as, flags: $fl, avg_score: $avg, history: $hi}' \
+            > "$HEALTH_FILE"
+
+          echo "::notice::Skill quality — $SKILL: score=$SCORE, avg=$AVG — $ASSESSMENT"
+
+      - name: Convert feed outputs
+        if: steps.work.outputs.mode != '' && vars.JSONRENDER_ENABLED != 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          BANKR_LLM_KEY: ${{ secrets.BANKR_LLM_KEY }}
+        run: |
+          if [ "${{ steps.run.outputs.GATEWAY }}" = "bankr" ] && [ -n "${BANKR_LLM_KEY:-}" ]; then
+            export ANTHROPIC_BASE_URL="https://llm.bankr.bot"
+            export ANTHROPIC_AUTH_TOKEN="$BANKR_LLM_KEY"
+            unset ANTHROPIC_API_KEY
+            unset CLAUDE_CODE_OAUTH_TOKEN
+          fi
+          for pending in dashboard/outputs/.pending-*.md; do
+            [ -f "$pending" ] || continue
+            SKILL=$(basename "$pending" .md | sed 's/^\.pending-//')
+            echo "json-render: converting $SKILL..."
+            ./notify-jsonrender "$SKILL" "$(cat "$pending")" && rm -f "$pending" || echo "json-render: $SKILL conversion failed (non-fatal)"
+          done
+
+      - name: Send pending notifications
+        if: steps.work.outputs.mode != '' && steps.run.outcome == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          NOTIFY_EMAIL_TO: ${{ secrets.NOTIFY_EMAIL_TO }}
+          NOTIFY_EMAIL_FROM: ${{ vars.NOTIFY_EMAIL_FROM || 'claw@notifications.clawtrl.bot' }}
+          NOTIFY_EMAIL_SUBJECT_PREFIX: ${{ vars.NOTIFY_EMAIL_SUBJECT_PREFIX || '[Claw]' }}
+          SKILL_NAME: ${{ steps.skill.outputs.name }}
+        run: |
+          # Re-deliver any .pending-notify/ messages that failed during sandbox.
+          # Skip messages whose hash was already sent by ./notify inline,
+          # and skip short test/trace probes that shouldn't reach channels.
+          if [ ! -d .pending-notify ] || [ -z "$(ls -A .pending-notify/*.md 2>/dev/null)" ]; then
+            echo "No pending notifications"
+            exit 0
+          fi
+          HASH_FILE=".notify-sent-hashes"
+          touch "$HASH_FILE"
+          for pending in .pending-notify/*.md; do
+            [ -f "$pending" ] || continue
+            MSG=$(cat "$pending")
+
+            # Suppress trivial probes
+            MSG_LEN=${#MSG}
+            if [ "$MSG_LEN" -lt 120 ]; then
+              MSG_LOWER=$(printf '%s' "$MSG" | tr '[:upper:]' '[:lower:]')
+              case "$MSG_LOWER" in
+                *test*|*trace*|*ping*|*debug*|hello|hi)
+                  echo "Skipping pending trace/test message: $MSG"
+                  continue
+                  ;;
+              esac
+            fi
+
+            # Dedup against messages already sent by ./notify inline
+            HASH=$(printf '%s' "$MSG" | sha256sum | awk '{print $1}')
+            if grep -qxF "$HASH" "$HASH_FILE" 2>/dev/null; then
+              echo "Skipping pending duplicate (${HASH:0:8}): $(basename "$pending")"
+              continue
+            fi
+            printf '%s\n' "$HASH" >> "$HASH_FILE"
+
+            echo "Delivering pending notification: $(basename "$pending")"
+            # Telegram
+            if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ]; then
+              TG_MSG="$MSG"
+              [ ${#TG_MSG} -gt 4000 ] && TG_MSG="${TG_MSG:0:3990}...(truncated)"
+              curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg chat "$TELEGRAM_CHAT_ID" --arg text "$TG_MSG" '{chat_id: $chat, text: $text}')" > /dev/null 2>&1 || true
+            fi
+            # Discord
+            if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+              curl -sf -X POST "$DISCORD_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg text "$MSG" '{content: $text}')" > /dev/null 2>&1 || true
+            fi
+            # Slack
+            if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+              curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+                -H "Content-Type: application/json" \
+                -d "$(jq -n --arg text "$MSG" '{text: $text}')" > /dev/null 2>&1 || true
+            fi
+          done
+          rm -rf .pending-notify
+
+      - name: Run post-process scripts
+        if: steps.work.outputs.mode != '' && steps.run.outcome == 'success'
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          REPLICATE_API_TOKEN: ${{ secrets.REPLICATE_API_TOKEN }}
+          DEVTO_API_KEY: ${{ secrets.DEVTO_API_KEY }}
+          NEYNAR_API_KEY: ${{ secrets.NEYNAR_API_KEY }}
+          NEYNAR_SIGNER_UUID: ${{ secrets.NEYNAR_SIGNER_UUID }}
+        run: |
+          # Run all scripts/postprocess-*.sh after Claude finishes.
+          # Each script handles its own .pending-{service}/ directory
+          # and checks its own env vars. Exit 0 if nothing to do.
+          for script in scripts/postprocess-*.sh; do
+            [ -f "$script" ] || continue
+            chmod +x "$script"
+            echo "Running $(basename "$script")..."
+            ./"$script" || echo "::notice::$(basename "$script") failed (non-fatal)"
+          done
+
+      - name: Commit results
+        if: steps.work.outputs.mode != ''
+        run: |
+          git config user.name "clawframework"
+          git config user.email "clawframework@proton.me"
+          rm -f ./notify .notify-sent-hashes  # Remove generated notify script + dedup log before committing
+
+          CURRENT_BRANCH=$(git branch --show-current)
+          LABEL="${{ steps.work.outputs.label }}"
+
+          # If Claude created a feature branch, push it then switch back to main
+          if [ "$CURRENT_BRANCH" != "main" ] && [ -n "$CURRENT_BRANCH" ]; then
+            echo "On feature branch: $CURRENT_BRANCH"
+            git add -A
+            git diff --staged --quiet || git commit -m "chore($LABEL): auto-commit $(date +%Y-%m-%d)"
+            git push --force-with-lease -u origin "$CURRENT_BRANCH" || true
+
+            # Switch back to main and cherry-pick memory/log changes if any
+            git checkout main
+            git pull --rebase origin main || true
+          fi
+
+          # Commit any remaining changes on main
+          git add -A
+          if git diff --staged --quiet; then
+            # Nothing new to commit — but Claude may have committed during its run.
+            # Check for unpushed commits and push them if any exist.
+            if [ "$(git rev-list origin/main..HEAD --count 2>/dev/null)" = "0" ]; then
+              echo "No changes to commit or push"
+              exit 0
+            fi
+            echo "No new changes, but found unpushed commits — pushing"
+          else
+            git commit -m "chore($LABEL): auto-commit $(date +%Y-%m-%d)"
+          fi
+          for i in 1 2 3 4 5; do
+            # Pull and rebase onto latest remote
+            if ! git pull --rebase origin main 2>/dev/null; then
+              echo "Rebase conflict on attempt $i, auto-resolving..."
+              while true; do
+                CONFLICTED=$(git diff --name-only --diff-filter=U) || true
+                [ -z "$CONFLICTED" ] && break
+                for f in $CONFLICTED; do
+                  if [[ "$f" == memory/logs/* ]] || [[ "$f" == memory/topics/* ]] || [[ "$f" == memory/MEMORY.md ]] || [[ "$f" == memory/skill-health/* ]] || [[ "$f" == dashboard/outputs/* ]] || [[ "$f" == .outputs/* ]]; then
+                    sed -i '/^<<<<<<< /d; /^=======/d; /^>>>>>>> /d' "$f"
+                    git add "$f"
+                  else
+                    git checkout --theirs "$f"
+                    git add "$f"
+                  fi
+                done
+                if git diff --cached --quiet; then
+                  git rebase --skip || true
+                else
+                  GIT_EDITOR=true git rebase --continue || true
+                fi
+              done
+            fi
+            # Try to push — if it fails, another job beat us, loop and re-pull
+            if git push -u origin HEAD 2>/dev/null; then
+              echo "Pushed successfully on attempt $i"
+              exit 0
+            fi
+            echo "Push attempt $i failed (ref moved), retrying in ${i}s..."
+            sleep "$i"
+          done
+          echo "Failed to push after 5 attempts"
+          exit 1
+
+      - name: Update cron state
+        if: always() && steps.skill.outputs.name != ''
+        run: |
+          SKILL="${{ steps.skill.outputs.name }}"
+          RUN_OUTCOME="${{ steps.run.outcome }}"
+          NOW_ISO=$(date -u +%FT%TZ)
+          STATE_FILE="memory/cron-state.json"
+          QUALITY_SCORE="${{ steps.analyze.outputs.QUALITY_SCORE }}"
+
+          # Determine status from step outcome
+          if [ "$RUN_OUTCOME" = "success" ]; then
+            CRON_STATUS="success"
+          else
+            CRON_STATUS="failed"
+          fi
+
+          # Read error signature if the skill failed
+          ERROR_SIG=""
+          if [ "$CRON_STATUS" = "failed" ] && [ -f /tmp/skill-error.txt ]; then
+            ERROR_SIG=$(cat /tmp/skill-error.txt)
+          fi
+
+          # Function: apply quality metrics update to STATE
+          apply_state_update() {
+            # Core status update
+            STATE=$(echo "$STATE" | jq --arg s "$SKILL" --arg st "$CRON_STATUS" --arg ts "$NOW_ISO" \
+              '.[$s].last_status = $st | .[$s]["last_" + $st] = $ts')
+
+            # Read current counters from state
+            PREV_RUNS=$(echo "$STATE" | jq --arg s "$SKILL" '.[$s].total_runs // 0')
+            PREV_SUCC=$(echo "$STATE" | jq --arg s "$SKILL" '.[$s].total_successes // 0')
+            PREV_FAIL=$(echo "$STATE" | jq --arg s "$SKILL" '.[$s].total_failures // 0')
+
+            NEW_RUNS=$((PREV_RUNS + 1))
+            if [ "$CRON_STATUS" = "success" ]; then
+              NEW_SUCC=$((PREV_SUCC + 1))
+              NEW_FAIL=$PREV_FAIL
+              NEW_CONSEC=0
+            else
+              NEW_SUCC=$PREV_SUCC
+              NEW_FAIL=$((PREV_FAIL + 1))
+              PREV_CONSEC=$(echo "$STATE" | jq --arg s "$SKILL" '.[$s].consecutive_failures // 0')
+              NEW_CONSEC=$((PREV_CONSEC + 1))
+            fi
+
+            RATE=$(jq -n "if $NEW_RUNS > 0 then ($NEW_SUCC / $NEW_RUNS * 100 | round) / 100 else 0 end")
+
+            STATE=$(echo "$STATE" | jq --arg s "$SKILL" \
+              --argjson runs "$NEW_RUNS" --argjson succ "$NEW_SUCC" --argjson fail "$NEW_FAIL" \
+              --argjson consec "$NEW_CONSEC" --argjson rate "$RATE" '
+              .[$s].total_runs = $runs |
+              .[$s].total_successes = $succ |
+              .[$s].total_failures = $fail |
+              .[$s].consecutive_failures = $consec |
+              .[$s].success_rate = $rate
+            ')
+
+            # Record error signature on failure
+            if [ "$CRON_STATUS" = "failed" ] && [ -n "$ERROR_SIG" ]; then
+              STATE=$(echo "$STATE" | jq --arg s "$SKILL" --arg err "$ERROR_SIG" \
+                '.[$s].last_error = $err')
+            fi
+
+            # Record quality score on success (from analysis step)
+            if [ -n "$QUALITY_SCORE" ] && [ "$QUALITY_SCORE" != "0" ]; then
+              STATE=$(echo "$STATE" | jq --arg s "$SKILL" --argjson q "$QUALITY_SCORE" \
+                '.[$s].last_quality_score = $q')
+            fi
+          }
+
+          # Ensure we're on main with latest
+          git checkout main 2>/dev/null || true
+          git pull --rebase origin main 2>/dev/null || true
+
+          # Read current state
+          if [ -f "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+            STATE=$(cat "$STATE_FILE")
+          else
+            STATE='{}'
+          fi
+
+          apply_state_update
+
+          mkdir -p memory
+          echo "$STATE" | jq '.' > "$STATE_FILE"
+
+          git add "$STATE_FILE"
+          if git diff --staged --quiet; then
+            echo "No state changes"
+            exit 0
+          fi
+
+          git commit -m "chore(cron): $SKILL $CRON_STATUS"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin main 2>/dev/null && git push -u origin HEAD 2>/dev/null; then
+              echo "Cron state updated: $SKILL=$CRON_STATUS"
+              exit 0
+            fi
+            # On conflict, take theirs and re-apply our update
+            git rebase --abort 2>/dev/null || true
+            git reset --soft HEAD~1 2>/dev/null || true
+            git checkout -- "$STATE_FILE" 2>/dev/null || true
+            git pull origin main 2>/dev/null || true
+
+            if [ -f "$STATE_FILE" ] && jq empty "$STATE_FILE" 2>/dev/null; then
+              STATE=$(cat "$STATE_FILE")
+            else
+              STATE='{}'
+            fi
+            apply_state_update
+            echo "$STATE" | jq '.' > "$STATE_FILE"
+            git add "$STATE_FILE"
+            git diff --staged --quiet && { echo "State already up to date"; exit 0; }
+            git commit -m "chore(cron): $SKILL $CRON_STATUS"
+            sleep "$i"
+          done
+          echo "::warning::Failed to commit cron state (non-fatal)"

@@ -1,0 +1,52 @@
+title: "Clawtrl — Skill Gallery"
+description: "Public output showcase for Clawtrl Autonomous, an autonomous AI agent running on GitHub Actions powered by Claude Code."
+baseurl: ""
+url: "https://portalfnd.github.io/clawtrlautonomous"
+
+# Build settings
+theme: minima
+markdown: kramdown
+
+# Author
+author:
+  name: Clawtrl
+  url: https://github.com/portalfnd/clawtrlautonomous
+
+# Navigation
+header_pages:
+  - index.md
+  - articles.md
+  - activity.md
+  - memory.md
+  - skills.md
+  - status.md
+
+# Permalinks
+permalink: /articles/:year/:month/:day/:title/
+
+# Collections
+collections:
+  posts:
+    output: true
+
+# Default front matter
+defaults:
+  - scope:
+      path: ""
+      type: "posts"
+    values:
+      layout: "post"
+
+# Exclude from processing
+exclude:
+  - "*.sh"
+  - "*.json"
+  - Gemfile
+  - Gemfile.lock
+  - node_modules/
+  - vendor/
+
+# Social links
+minima:
+  social_links:
+    - { platform: github, user_url: "https://github.com/portalfnd/clawtrlautonomous" }

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+DASHBOARD="$DIR/dashboard"
+
+# Preflight: the dashboard's /api/* routes shell out to `gh` for secrets,
+# workflow runs, and auth. Without an authenticated gh CLI nothing works,
+# and the failure shows up much later as a 503 in the Authenticate modal.
+if ! command -v gh >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+GitHub CLI (`gh`) not found.
+
+The dashboard uses `gh` to manage repo secrets, dispatch workflows, and
+read your repo. Install it before launching:
+
+  macOS:        brew install gh   (or download the arm64/amd64 binary from
+                                   https://github.com/cli/cli/releases and
+                                   put it on PATH — no sudo required)
+  Linux:        see https://github.com/cli/cli#installation
+  Windows:      winget install --id GitHub.cli
+
+Then run: gh auth login
+EOF
+  exit 1
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+GitHub CLI is installed but not authenticated.
+
+Run:  gh auth login
+
+Then re-run ./claw. The dashboard also needs a default repo — once you've
+created/cloned your own copy, set it with:
+
+  gh repo set-default <owner>/<repo>
+EOF
+  exit 1
+fi
+
+cd "$DASHBOARD"
+
+# Install deps if needed
+if [ ! -d node_modules ]; then
+  echo "Installing dependencies..."
+  npm install
+fi
+
+PORT="${PORT:-5555}"
+
+# Kill any existing next dev server in this directory
+LOCKFILE="$DASHBOARD/.next/dev/lock"
+if [ -f "$LOCKFILE" ]; then
+  OLD_PID=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['pid'])" "$LOCKFILE" 2>/dev/null || true)
+  if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "Stopping existing dev server (PID $OLD_PID)..."
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 1
+  fi
+  rm -f "$LOCKFILE"
+fi
+
+# Find an open port starting from $PORT
+while lsof -iTCP:"$PORT" -sTCP:LISTEN -t >/dev/null 2>&1; do
+  PORT=$((PORT + 1))
+done
+
+echo ""
+echo "  ╔══════════════════════════════════════╗"
+echo "  ║         ⚡ clawtrl-autonomous ⚡          ║"
+echo "  ║                                      ║"
+printf "  ║   ➜  http://localhost:%-15s ║\n" "$PORT"
+echo "  ║                                      ║"
+echo "  ╚══════════════════════════════════════╝"
+echo ""
+
+npm run dev -- -p "$PORT"

@@ -1,0 +1,83 @@
+name: Telegram Burst
+
+# Burst mode for the Telegram relay. Long-polls Telegram for ~9 minutes,
+# dispatching commands as they arrive (latency: seconds, not 15 minutes).
+# Use this when you're in a live ops session. Cron mode (the telegram-relay
+# skill on a 15-min schedule) covers ambient operation.
+#
+# Trigger: workflow_dispatch (manual) or repository_dispatch with
+# event_type='telegram-burst' (e.g. fired by another skill).
+#
+# Cost: 1 job-minute per burst. Public repos: free. Private repos: counted
+# against the 2,000 minute/month free tier.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'How long to long-poll (max 9)'
+        required: false
+        type: string
+        default: '9'
+  repository_dispatch:
+    types: [telegram-burst]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: telegram-burst
+  cancel-in-progress: false
+
+jobs:
+  burst:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "clawframework"
+          git config user.email "clawframework@proton.me"
+
+      - name: Long-poll loop
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_POLL_TIMEOUT: '30'
+          GH_TOKEN: ${{ secrets.GH_GLOBAL || secrets.GITHUB_TOKEN }}
+          DURATION: ${{ github.event.inputs.duration_minutes || '9' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram secrets not configured — skipping burst"; exit 0
+          fi
+          chmod +x scripts/telegram-relay.sh
+
+          # Cap duration at 9 minutes to leave headroom inside timeout-minutes.
+          DUR=${DURATION:-9}
+          case "$DUR" in ''|*[!0-9]*) DUR=9 ;; esac
+          [ "$DUR" -gt 9 ] && DUR=9
+          DEADLINE=$(( $(date +%s) + DUR * 60 ))
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            bash scripts/telegram-relay.sh || echo "::warning::relay iteration failed"
+            # Short pause if Telegram returned immediately (no messages, no
+            # long-poll wait) to avoid hammering the API.
+            sleep 1
+          done
+
+      - name: Commit state changes
+        run: |
+          git add memory/telegram-relay/ claw.yml 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "ops(telegram-burst): commit state and config changes"
+            git push
+          else
+            echo "No state changes to commit"
+          fi

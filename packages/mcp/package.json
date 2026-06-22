@@ -1,0 +1,34 @@
+{
+  "name": "@clawtrl/mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server that exposes a Clawtrl Ops fleet as tools (status, run, recruit, feed, wallet) over stdio. Zero infra: runs locally, talks to your fork via the GitHub API.",
+  "type": "module",
+  "bin": {
+    "clawtrl-mcp": "./bin/clawtrl-mcp.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "clawtrl",
+    "agents",
+    "claude"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/portalfnd/clawtrlautonomous.git",
+    "directory": "packages/mcp"
+  }
+}

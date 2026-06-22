@@ -1,0 +1,110 @@
+name: Sync from upstream
+
+# Opt-in: trigger manually via GitHub Actions "Run workflow" button.
+# No automatic schedule — prevents surprise merge conflicts with custom Clawtrl changes.
+# When triggered, pulls latest from aaronjmars/aeon and opens a PR for review.
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repo to sync from (owner/repo)'
+        required: false
+        default: 'aaronjmars/aeon'
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "clawtrl-sync-bot"
+          git config user.email "clawtrl-sync-bot@users.noreply.github.com"
+
+      - name: Fetch upstream
+        env:
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'aaronjmars/aeon' }}
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Check for upstream changes
+        id: diff
+        env:
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+        run: |
+          AHEAD=$(git rev-list --count HEAD..upstream/${UPSTREAM_BRANCH})
+          echo "ahead=$AHEAD" >> "$GITHUB_OUTPUT"
+          echo "Upstream is $AHEAD commits ahead of fork."
+
+      - name: Exit if nothing to merge
+        if: steps.diff.outputs.ahead == '0'
+        run: echo "Already up to date — skipping."
+
+      - name: Create sync branch and attempt merge
+        if: steps.diff.outputs.ahead != '0'
+        id: merge
+        env:
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'aaronjmars/aeon' }}
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+        run: |
+          BRANCH="sync/upstream-$(date -u +%Y%m%d)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git add -A
+            # --no-verify: tree has unresolved conflict markers by design so
+            # reviewers can see what to fix; commit hooks would reject them.
+            git commit -m "sync: merge ${UPSTREAM_REPO}/${UPSTREAM_BRANCH} (CONFLICTS — resolve before merging)" --no-verify || true
+          fi
+
+      - name: Push sync branch
+        if: steps.diff.outputs.ahead != '0'
+        run: git push origin "${{ steps.merge.outputs.branch }}"
+
+      - name: Open or update PR
+        if: steps.diff.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          CONFLICT="${{ steps.merge.outputs.conflict }}"
+          AHEAD="${{ steps.diff.outputs.ahead }}"
+
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo || 'aaronjmars/aeon' }}"
+
+          if [ "$CONFLICT" = "true" ]; then
+            TITLE="sync: ${UPSTREAM_REPO} (CONFLICTS, $AHEAD commits)"
+            BODY="Manual upstream sync — **merge conflicts present, resolve manually**.\n\nUpstream ${UPSTREAM_REPO} is $AHEAD commits ahead. Conflict markers committed; fix them locally:\n\n\`\`\`\ngit fetch origin $BRANCH && git checkout $BRANCH\n# resolve conflicts\ngit add -A && git commit --amend --no-edit && git push -f origin $BRANCH\n\`\`\`"
+          else
+            TITLE="sync: ${UPSTREAM_REPO} ($AHEAD commits)"
+            BODY="Manual upstream sync — clean merge, $AHEAD commits from ${UPSTREAM_REPO}.\n\nReview the diff and merge to pull in the latest skills, workflows, and fixes.\n\n**Check for conflicts with custom Clawtrl changes** (dashboard, wallet, MCP, security) before merging."
+          fi
+
+          EXISTING=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' || echo "")
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "$TITLE" --body "$(printf '%b' "$BODY")"
+          else
+            gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$(printf '%b' "$BODY")"
+          fi
