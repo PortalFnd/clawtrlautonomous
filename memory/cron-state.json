@@ -1,13 +1,13 @@
 {
   "heartbeat": {
     "last_dispatch": "2026-07-14T14:18:42Z",
-    "last_status": "dispatched",
-    "last_failed": "2026-07-14T12:20:52Z",
-    "total_runs": 264,
+    "last_status": "failed",
+    "last_failed": "2026-07-14T14:19:01Z",
+    "total_runs": 265,
     "total_successes": 0,
-    "total_failures": 264,
-    "consecutive_failures": 264,
+    "total_failures": 265,
+    "consecutive_failures": 265,
     "success_rate": 0,
-    "last_error": "f78aedd\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\""
+    "last_error": "6640c47\",\"total_cost_usd\":0,\"usage\":{\"input_tokens\":0,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":0,\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\""
   }
 }
