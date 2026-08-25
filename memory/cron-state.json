@@ -1,13 +1,13 @@
 {
   "heartbeat": {
     "last_dispatch": "2026-08-25T03:49:46Z",
-    "last_status": "dispatched",
-    "last_failed": "2026-08-25T02:58:38Z",
-    "total_runs": 1081,
+    "last_status": "failed",
+    "last_failed": "2026-08-25T03:50:05Z",
+    "total_runs": 1082,
     "total_successes": 0,
-    "total_failures": 1081,
-    "consecutive_failures": 1081,
+    "total_failures": 1082,
+    "consecutive_failures": 1082,
     "success_rate": 0,
-    "last_error": "pt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{"
+    "last_error": "isabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0"
   }
 }
