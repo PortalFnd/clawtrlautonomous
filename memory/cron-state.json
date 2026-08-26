@@ -1,12 +1,12 @@
 {
   "heartbeat": {
     "last_dispatch": "2026-08-26T06:29:12Z",
-    "last_status": "dispatched",
-    "last_failed": "2026-08-26T05:59:08Z",
-    "total_runs": 1112,
+    "last_status": "failed",
+    "last_failed": "2026-08-26T06:29:29Z",
+    "total_runs": 1113,
     "total_successes": 0,
-    "total_failures": 1112,
-    "consecutive_failures": 1112,
+    "total_failures": 1113,
+    "consecutive_failures": 1113,
     "success_rate": 0,
     "last_error": "pt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{"
   }
